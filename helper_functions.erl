@@ -8,25 +8,25 @@
 
 % Transactions
 %% AENS
--export([ preclaim_tx/5
-        , preclaim_tx/6
+-export([ preclaim_tx/3
+        , preclaim_tx/4
         ]).
 
 %% Spend
--export([ spend_tx/5
-        , spend_tx/6
+-export([ spend_tx/3
+        , spend_tx/4
         ]).
 
 %% Channels
--export([ channel_create_tx/9
-        , channel_close_mutual_tx/6
+-export([ channel_create_tx/7
+        , channel_close_mutual_tx/4
         , channel_close_solo_tx/6
         , channel_slash_tx/6
-        , channel_settle_tx/6
-        , channel_withdraw_tx/7
-        , channel_deposit_tx/7
-        , channel_snapshot_tx/5
-        , channel_force_progress_tx/9
+        , channel_settle_tx/4
+        , channel_withdraw_tx/5
+        , channel_deposit_tx/5
+        , channel_snapshot_tx/6
+        , channel_force_progress_tx/7
         ]).
 
 decode_key_pair(Dir, Pass) ->
@@ -45,149 +45,172 @@ decode_key_pair(Dir, Pass) ->
     {PrivKey, PubKey}.
 
 %% AENS
-preclaim_tx(Name, Salt, Owner, Nonce, Fee) ->
-    preclaim_tx(Name, Salt, Owner, Nonce, Fee, 0).
+preclaim_tx(Name, Salt, Owner) ->
+    preclaim_tx(Name, Salt, Owner, 0).
 
-preclaim_tx(Name, Salt, Owner, Nonce, Fee, TTL) ->
+preclaim_tx(Name, Salt, Owner, TTL) ->
     {ok, NameAscii} = aens_utils:to_ascii(Name),
     CHash = aens_hash:commitment_hash(NameAscii, Salt),
     TxSpec =
         #{account_id    => aec_id:create(account, Owner),
-          nonce         => Nonce,
+          nonce         => next_nonce(Owner),
           commitment_id => aec_id:create(commitment, CHash),
-          fee           => Fee,
           ttl           => TTL},
-    {ok, _Tx} = aens_preclaim_tx:new(TxSpec).
+    {ok, _Tx} = tx_with_minimal_fee(TxSpec, aens_preclaim_tx).
 
 %% SPEND
-spend_tx(From, To, Nonce, Amount, Fee) ->
-    spend_tx(From, To, Nonce, Amount, Fee, <<>>).
+spend_tx(From, To, Amount) ->
+    spend_tx(From, To, Amount, <<>>).
 
-spend_tx(From, To, Nonce, Amount, Fee, Payload) ->
+spend_tx(From, To, Amount, Payload) ->
     TxSpec =
         #{sender_id     => aec_id:create(account, From),
           recipient_id  => aec_id:create(account, To),
           amount        => Amount,
-          nonce         => Nonce,
-          payload       => Payload,
-          fee           => Fee},
-    {ok, _Tx} = aec_spend_tx:new(TxSpec).
+          nonce         => next_nonce(From),
+          payload       => Payload},
+    {ok, _Tx} = tx_with_minimal_fee(TxSpec, aec_spend_tx).
 
 %% Channels
 channel_create_tx(Initiator, InitiatorAmount,
                   Responder, ResponderAmount,
-                  ChannelReserve, LockPeriod, Fee,
-                  StateHash, Nonce) ->
-  TxSpec =
-      #{initiator_id       => aec_id:create(account, Initiator),
-        initiator_amount   => InitiatorAmount,
-        responder_id       => aec_id:create(account, Responder),
-        responder_amount   => ResponderAmount,
-        channel_reserve    => ChannelReserve,
-        lock_period        => LockPeriod,
-        fee                => Fee,
-        state_hash         => StateHash,
-        nonce              => Nonce},
-    {ok, _Tx} = aesc_create_tx:new(TxSpec).
+                  ChannelReserve, LockPeriod,
+                  StateHash) ->
+    TxSpec =
+        #{initiator_id       => aec_id:create(account, Initiator),
+          initiator_amount   => InitiatorAmount,
+          responder_id       => aec_id:create(account, Responder),
+          responder_amount   => ResponderAmount,
+          channel_reserve    => ChannelReserve,
+          lock_period        => LockPeriod,
+          state_hash         => StateHash,
+          nonce         => next_nonce(Initiator)},
+    {ok, _Tx} = tx_with_minimal_fee(TxSpec, aesc_create_tx).
 
-channel_close_mutual_tx(Channel, From,
-                        InitiatorAmount, ResponderAmount,
-                        Fee, Nonce) ->
-  TxSpec =
-      #{channel_id              => aec_id:create(channel, Channel),
-        from_id                 => aec_id:create(account, From),
-        initiator_amount_final  => InitiatorAmount,
-        responder_amount_final  => ResponderAmount,
-        fee                     => Fee,
-        nonce                   => Nonce},
-    {ok, _Tx} = aesc_close_mutual_tx:new(TxSpec).
+channel_close_mutual_tx(Channel, From, InitiatorAmount, ResponderAmount) ->
+    TxSpec =
+        #{channel_id              => aec_id:create(channel, Channel),
+          from_id                 => aec_id:create(account, From),
+          initiator_amount_final  => InitiatorAmount,
+          responder_amount_final  => ResponderAmount,
+          nonce         => next_nonce(From)},
+    {ok, _Tx} = tx_with_minimal_fee(TxSpec, aesc_close_mutual_tx).
 
-channel_close_solo_tx(Channel, From,
-                      Payload, PoI,
-                      Fee, Nonce) ->
-  TxSpec =
-      #{channel_id => aec_id:create(channel, Channel),
-        from_id    => aec_id:create(account, From),
-        payload    => Payload,
-        poi        => PoI,
-        fee        => Fee,
-        nonce      => Nonce},
-    {ok, _Tx} = aesc_close_solo_tx:new(TxSpec).
+channel_close_solo_tx(ChannelPubkey, From, IAmt, RAmt, Round, BothPrivkeys) ->
+    {PoI, Payload} = poi_and_payload(ChannelPubkey, IAmt, RAmt, Round,
+                                     BothPrivkeys),
+    TxSpec =
+        #{channel_id => aec_id:create(channel, ChannelPubkey),
+          from_id    => aec_id:create(account, From),
+          payload    => Payload,
+          poi        => PoI,
+          nonce      => next_nonce(From)},
+    {ok, _Tx} = tx_with_minimal_fee(TxSpec, aesc_close_solo_tx).
 
-channel_slash_tx(Channel, From,
-                      Payload, PoI,
-                      Fee, Nonce) ->
-  TxSpec =
-      #{channel_id => aec_id:create(channel, Channel),
-        from_id    => aec_id:create(account, From),
-        payload    => Payload,
-        poi        => PoI,
-        fee        => Fee,
-        nonce      => Nonce},
-    {ok, _Tx} = aesc_slash_tx:new(TxSpec).
+channel_slash_tx(ChannelPubkey, From, IAmt, RAmt, Round, BothPrivkeys) ->
+    {PoI, Payload} = poi_and_payload(ChannelPubkey, IAmt, RAmt, Round,
+                                     BothPrivkeys),
+    TxSpec =
+        #{channel_id => aec_id:create(channel, ChannelPubkey),
+          from_id    => aec_id:create(account, From),
+          payload    => Payload,
+          poi        => PoI,
+          nonce      => 19},% next_nonce(From)},
+    {ok, _Tx} = tx_with_minimal_fee(TxSpec, aesc_slash_tx).
 
-channel_settle_tx(Channel, From,
-                  InitiatorAmount, ResponderAmount,
-                  Fee, Nonce) ->
-  TxSpec =
-      #{channel_id => aec_id:create(channel, Channel),
-        from_id    => aec_id:create(account, From),
-        initiator_amount_final  => InitiatorAmount,
-        responder_amount_final  => ResponderAmount,
-        fee        => Fee,
-        nonce      => Nonce},
-    {ok, _Tx} = aesc_settle_tx:new(TxSpec).
+channel_settle_tx(Channel, From, InitiatorAmount, ResponderAmount) ->
+    TxSpec =
+        #{channel_id => aec_id:create(channel, Channel),
+          from_id    => aec_id:create(account, From),
+          initiator_amount_final  => InitiatorAmount,
+          responder_amount_final  => ResponderAmount,
+          nonce      => next_nonce(From)},
+    {ok, _Tx} = tx_with_minimal_fee(TxSpec, aesc_settle_tx).
 
-channel_withdraw_tx(Channel, To,
-                    Amount, StateHash, Round,
-                    Fee, Nonce) ->
-  TxSpec =
-      #{channel_id  => aec_id:create(channel, Channel),
-        to_id       => aec_id:create(account, To),
-        amount      => Amount,
-        state_hash  => StateHash,
-        round       => Round,
-        fee         => Fee,
-        nonce       => Nonce},
-    {ok, _Tx} = aesc_withdraw_tx:new(TxSpec).
+channel_withdraw_tx(Channel, To, Amount, StateHash, Round) ->
+    TxSpec =
+        #{channel_id  => aec_id:create(channel, Channel),
+          to_id       => aec_id:create(account, To),
+          amount      => Amount,
+          state_hash  => StateHash,
+          round       => Round,
+          nonce      => next_nonce(To)},
+    {ok, _Tx} = tx_with_minimal_fee(TxSpec, aesc_withdraw_tx).
 
-channel_deposit_tx(Channel, From,
-                   Amount, StateHash, Round,
-                   Fee, Nonce) ->
-  TxSpec =
-      #{channel_id  => aec_id:create(channel, Channel),
-        from_id     => aec_id:create(account, From),
-        amount      => Amount,
-        state_hash  => StateHash,
-        round       => Round,
-        fee         => Fee,
-        nonce       => Nonce},
-    {ok, _Tx} = aesc_deposit_tx:new(TxSpec).
+channel_deposit_tx(Channel, From,Amount, StateHash, Round) ->
+    TxSpec =
+        #{channel_id  => aec_id:create(channel, Channel),
+          from_id     => aec_id:create(account, From),
+          amount      => Amount,
+          state_hash  => StateHash,
+          round       => Round,
+          nonce       => next_nonce(From)},
+    {ok, _Tx} = tx_with_minimal_fee(TxSpec, aesc_deposit_tx).
 
-channel_snapshot_tx(Channel, From,
-                    Payload, Fee, Nonce) ->
-  TxSpec =
-      #{channel_id  => aec_id:create(channel, Channel),
-        from_id     => aec_id:create(account, From),
-        payload     => Payload,
-        fee         => Fee,
-        nonce       => Nonce},
-    {ok, _Tx} = aesc_snapshot_solo_tx:new(TxSpec).
+channel_snapshot_tx(Channel, From, Updates, OldHash, OldRound, BothPrivkeys) ->
+    TxSpec =
+        #{channel_id  => aec_id:create(channel, Channel),
+          from_id     => aec_id:create(account, From),
+          payload     => off_chain_payload(aec_id:create(channel, Channel),
+                                          Updates, OldHash,
+                                          OldRound, BothPrivkeys),
+          nonce       => next_nonce(From)},
+    {ok, _Tx} = tx_with_minimal_fee(TxSpec, aesc_snapshot_solo_tx).
 
-channel_force_progress_tx(Channel, From,
-                          Payload, Update, StateHash, Round, OffChainTrees,
-                          Fee, Nonce) ->
-  TxSpec =
-      #{channel_id      => aec_id:create(channel, Channel),
-        from_id         => aec_id:create(account, From),
-        payload         => Payload,
-        update          => Update,
-        state_hash      => StateHash,
-        round           => Round,
-        offchain_trees  => OffChainTrees,
-        fee             => Fee,
-        nonce           => Nonce},
-    {ok, _Tx} = aesc_force_progress_tx:new(TxSpec).
+channel_force_progress_tx(Channel, From, Payload, Update, StateHash,
+                          Round, OffChainTrees) ->
+    TxSpec =
+        #{channel_id      => aec_id:create(channel, Channel),
+          from_id         => aec_id:create(account, From),
+          payload         => Payload,
+          update          => Update,
+          state_hash      => StateHash,
+          round           => Round,
+          offchain_trees  => OffChainTrees,
+          nonce           => next_nonce(From)},
+    {ok, _Tx} = tx_with_minimal_fee(TxSpec, aesc_force_progress_tx).
+
+make_channel_force_progress_tx(ChannelPubkey, From, FromPrivkey,
+                               BothPrivkeys, IAmt, RAmt,
+                               ContractPubkey,
+                               ContractsAndBalances,
+                               CallData,
+                               Round) ->
+    ChannelId = aec_id:create(channel, ChannelPubkey),
+    Channel = get_channel(ChannelPubkey),
+    Initiator = aesc_channels:initiator_pubkey(Channel),
+    Responder = aesc_channels:responder_pubkey(Channel),
+    Reserve   = aesc_channels:channel_reserve(Channel),
+    Contracts = [C || {C, _Amt} <- ContractsAndBalances],
+    ContractBalances =
+        lists:map(
+            fun({Contract, Amt}) ->
+                Pubkey = aect_contracts:pubkey(Contract),
+                {Pubkey, Amt}
+            end,
+            ContractsAndBalances),
+    OffChainTrees =
+        create_offchain_trees([{Initiator, IAmt}, {Responder, RAmt}]
+                                  ++ ContractBalances,
+                              Contracts),
+    Payload = off_chain_payload(ChannelId, [], aec_trees:hash(OffChainTrees),
+                                Round - 1, BothPrivkeys),
+    VmVersion = 1,
+    CallStack = [],
+    CallAmount = 1,
+    Update =
+        aesc_offchain_update:op_call_contract(aec_id:create(account, From),
+                                              aec_id:create(contract, ContractPubkey),
+                                              VmVersion,
+                                              CallAmount, CallData, CallStack),
+    {OnChainEnv, OnChainTrees} =
+        aetx_env:tx_env_and_trees_from_top(aetx_contract),
+    UpdatedTrees =
+        aesc_offchain_update:apply_on_trees(Update, OffChainTrees, OnChainTrees,
+                                            OnChainEnv, Round, Reserve),
+    StateHash = aec_trees:hash(UpdatedTrees),
+    channel_force_progress_tx(ChannelPubkey, From,
+                              Payload, Update, StateHash, Round, OffChainTrees).
 
 %% Higher level
 create_sign_post(FunName, Args, PrivKeys) ->
@@ -200,8 +223,17 @@ get_tx_state(TxHash) ->
 		case aec_chain:find_tx_with_location(TxHash) of
 				none ->
 						{error, not_found};
-				{Tag, Tx} ->
-						{ok, #{tx => Tx, tx_block_hash => Tag}}
+				{mempool, Tx} ->
+						{ok, #{tx => Tx, tx_block_hash => not_mined_yet}};
+				{Hash, Tx} ->
+            {ok, Header} = aec_chain:get_header(Hash),
+            Height = aec_headers:height(Header),
+            TopHeader = aec_chain:top_header(),
+            TopHeight = aec_headers:height(TopHeader),
+						{ok, #{tx => Tx,
+                   tx_block_hash => Hash,
+                   tx_block_height => Height,
+                   key_confirmations => TopHeight - Height}}
 		end.
 
 %% {ok, SignedTx} = helper_functions:sign_tx(Tx, PrivKey).
@@ -218,6 +250,88 @@ force_gossip_txs_in_pool() ->
           || {ok, Txs} <- [aec_tx_pool:peek(30)], Tx <- Txs ],
     ok.
 
-%% {ok, UlfPubkey} = aehttp_api_encoder:safe_decode(account_pubkey, <<"ak_DqPzA1FnQ5TVT6STu6UZy5Grj6cfCm48S3uni9BUp9HipHVNB">>).
-%% {ok, Tx} = helper_functions:spend_tx(PubKey, UlfPubkey, 1, 100000, 17000, <<>>).
-%% {ok, SignedTx} = helper_functions:sign_tx(Tx, PrivKey).
+-spec create_offchain_trees([{aec_keys:pubkey(), non_neg_integer()}],
+                            [aect_contracts:contract()]) -> aec_trees:trees().
+create_offchain_trees(Accs, Contracts) ->
+    Accounts = [aec_accounts:new(Pubkey, Balance) ||
+                {Pubkey, Balance} <- Accs],
+    StateTreesEmpty = aec_trees:new_without_backend(),
+    Set =
+        fun(StateTrees0, GetterFun, SetterFun, EnterFun, Vals) ->
+            Tree0 = GetterFun(StateTrees0),
+            Tree1 = lists:foldl(EnterFun, Tree0, Vals),
+            SetterFun(StateTrees0, Tree1)
+        end,
+    StateTrees1 = Set(StateTreesEmpty, fun aec_trees:accounts/1,
+                      fun aec_trees:set_accounts/2,
+                      fun aec_accounts_trees:enter/2,
+                      Accounts),
+    StateTrees2 = Set(StateTrees1, fun aec_trees:contracts/1,
+                      fun aec_trees:set_contracts/2,
+                      fun aect_state_tree:enter_contract/2,
+                      Contracts),
+    StateTrees2.
+
+%% Private 
+run(Cfg, Funs) ->
+    lists:foldl(
+        fun(Fun, Props) -> Fun(Props) end,
+        Cfg,
+        Funs).
+
+get_channel(ChannelPubkey) ->
+    Hash = aec_chain:top_block_hash(),
+    {ok, Trees}  = aec_chain:get_block_state(Hash),
+    Channels = aec_trees:channels(Trees),
+    case aesc_state_tree:lookup(ChannelPubkey, Channels) of
+        none -> error(unknown_channel);
+        {value, Channel} -> Channel
+    end.
+
+off_chain_payload(ChannelId, Updates, OldStateHash, OldRound,
+                  BothPrivkeys) ->
+    {ok, LastOffChainTx} =
+        aesc_offchain_tx:new(#{channel_id => ChannelId,
+                               updates    => [], %% TODO...
+                               state_hash => OldStateHash,
+                               round      => OldRound}),
+    {ok, SignedLastOffTx} = sign_tx(LastOffChainTx, BothPrivkeys),
+    _Payload = aetx_sign:serialize_to_binary(SignedLastOffTx).
+
+next_nonce(Pubkey) ->
+    {ok, Nonce} =  aec_next_nonce:pick_for_account(Pubkey),
+    Nonce.
+
+tx_with_minimal_fee(TxSpec, Mod) ->
+  tx_with_minimal_fee_(TxSpec#{fee => 0}, Mod).
+
+tx_with_minimal_fee_(TxSpec, Mod) ->
+    {ok, Tx0} = Mod:new(TxSpec),
+    Header = aec_chain:top_header(),
+    Height = aec_headers:height(Header),
+    MinFee = aetx:min_fee(Tx0, Height),
+    {ok, Tx} = Mod:new(TxSpec#{fee => MinFee}),
+    case aetx:min_fee(Tx, Height) =:= MinFee of
+        true -> {ok, Tx};
+        false -> tx_with_minimal_fee_(TxSpec#{fee => MinFee}, Mod)
+    end.
+
+poi_and_payload(ChannelPubkey, IAmt, RAmt, Round, BothPrivkeys) ->
+    ChannelId = aec_id:create(channel, ChannelPubkey),
+    Channel = get_channel(ChannelPubkey),
+    Initiator = aesc_channels:initiator_pubkey(Channel),
+    Responder = aesc_channels:responder_pubkey(Channel),
+    OffChainTrees =
+        create_offchain_trees([{Initiator, IAmt}, {Responder, RAmt}], []),
+    Payload = off_chain_payload(ChannelId, [], aec_trees:hash(OffChainTrees),
+                                Round, BothPrivkeys),
+    PoI =
+        lists:foldl(
+            fun(Pubkey, AccumPoI) ->
+                {ok, AccumPoI1} = aec_trees:add_poi(accounts, Pubkey,
+                                                    OffChainTrees, AccumPoI),
+                AccumPoI1
+            end,
+            aec_trees:new_poi(OffChainTrees),
+            [Initiator, Responder]),
+    {PoI, Payload}.
