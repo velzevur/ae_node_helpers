@@ -1,11 +1,14 @@
 -module(helper_functions).
 -export([ decode_key_pair/2
-				, create_sign_post/3
+        , create_sign_post/3
         , get_tx_state/1
         , sign_tx/2
         , force_gossip_txs_in_pool/0
         ]).
 
+-export([new_contract/6,
+         compile_contract/1,
+         make_call/3]).
 % Transactions
 %% AENS
 -export([ preclaim_tx/3
@@ -27,6 +30,13 @@
         , channel_deposit_tx/5
         , channel_snapshot_tx/6
         , channel_force_progress_tx/7
+        , make_channel_force_progress_tx/9
+        ]).
+
+-export([ contract_create_tx/8
+        , contract_call_tx/7
+        , get_contract_id_by_create_tx/1
+        , get_contract_call_by_call_hash/1
         ]).
 
 decode_key_pair(Dir, Pass) ->
@@ -170,7 +180,7 @@ channel_force_progress_tx(Channel, From, Payload, Update, StateHash,
           nonce           => next_nonce(From)},
     {ok, _Tx} = tx_with_minimal_fee(TxSpec, aesc_force_progress_tx).
 
-make_channel_force_progress_tx(ChannelPubkey, From, FromPrivkey,
+make_channel_force_progress_tx(ChannelPubkey, From,
                                BothPrivkeys, IAmt, RAmt,
                                ContractPubkey,
                                ContractsAndBalances,
@@ -193,6 +203,8 @@ make_channel_force_progress_tx(ChannelPubkey, From, FromPrivkey,
         create_offchain_trees([{Initiator, IAmt}, {Responder, RAmt}]
                                   ++ ContractBalances,
                               Contracts),
+    ContractsTree = aec_trees:contracts(OffChainTrees),
+    aect_state_tree:get_contract(ContractPubkey, ContractsTree),
     Payload = off_chain_payload(ChannelId, [], aec_trees:hash(OffChainTrees),
                                 Round - 1, BothPrivkeys),
     VmVersion = 1,
@@ -202,7 +214,8 @@ make_channel_force_progress_tx(ChannelPubkey, From, FromPrivkey,
         aesc_offchain_update:op_call_contract(aec_id:create(account, From),
                                               aec_id:create(contract, ContractPubkey),
                                               VmVersion,
-                                              CallAmount, CallData, CallStack),
+                                              CallAmount, CallData, CallStack,
+                                              1, 100000),
     {OnChainEnv, OnChainTrees} =
         aetx_env:tx_env_and_trees_from_top(aetx_contract),
     UpdatedTrees =
@@ -211,6 +224,31 @@ make_channel_force_progress_tx(ChannelPubkey, From, FromPrivkey,
     StateHash = aec_trees:hash(UpdatedTrees),
     channel_force_progress_tx(ChannelPubkey, From,
                               Payload, Update, StateHash, Round, OffChainTrees).
+
+contract_create_tx(Owner, Code, VmVersion, Deposit, Amount, Gas, GasPrice, CallData) ->
+    TxSpec =
+        #{owner_id        => aec_id:create(account, Owner),
+          code            => Code,
+          vm_version      => VmVersion,
+          deposit         => Deposit,
+          amount          => Amount,
+          gas             => Gas,
+          gas_price       => GasPrice,
+          call_data       => CallData,
+          nonce           => next_nonce(Owner)},
+    {ok, _Tx} = tx_with_minimal_fee(TxSpec, aect_create_tx).
+
+contract_call_tx(Caller, ContractPubkey, VmVersion, Amount, Gas, GasPrice, CallData) ->
+    TxSpec =
+        #{caller_id       => aec_id:create(account, Caller),
+          contract_id     => aec_id:create(contract, ContractPubkey),
+          vm_version      => VmVersion,
+          amount          => Amount,
+          gas             => Gas,
+          gas_price       => GasPrice,
+          call_data       => CallData,
+          nonce           => next_nonce(Caller)},
+    {ok, _Tx} = tx_with_minimal_fee(TxSpec, aect_call_tx).
 
 %% Higher level
 create_sign_post(FunName, Args, PrivKeys) ->
@@ -235,6 +273,26 @@ get_tx_state(TxHash) ->
                    tx_block_height => Height,
                    key_confirmations => TopHeight - Height}}
 		end.
+
+get_contract_call_by_call_hash(ContractCallTxHash) ->
+    case get_tx_state(ContractCallTxHash) of
+        {error, not_found} -> {error, no_call_yet};
+        {ok, #{tx_block_hash := not_mined_yet}} -> {error, no_call_yet};
+        {ok, #{tx := SignedTx, tx_block_hash := BlockHash}} ->
+            {contract_call_tx, CallTx} =
+                aetx:specialize_type(aetx_sign:tx(SignedTx)),
+            CallId = aect_call_tx:call_id(CallTx),
+            ContractPubkey = aect_call_tx:contract_pubkey(CallTx),
+            case aec_chain:get_contract_call(ContractPubkey, CallId, BlockHash) of
+                {error, _Why} = Err -> Err;
+                {ok, _CallObject} = Ok -> Ok
+            end
+      end.
+
+get_contract_id_by_create_tx(CreateTxHash) ->
+    {ok, #{tx := SignedCreateTx}} = helper_functions:get_tx_state(CreateTxHash),
+    {contract_create_tx, CreateTx} = aetx:specialize_type(aetx_sign:tx(SignedCreateTx)),
+    _ContractPubkey = aect_create_tx:contract_pubkey(CreateTx).
 
 %% {ok, SignedTx} = helper_functions:sign_tx(Tx, PrivKey).
 sign_tx(UnsignedTx, PrivK)when is_binary(PrivK) ->
@@ -268,7 +326,7 @@ create_offchain_trees(Accs, Contracts) ->
                       Accounts),
     StateTrees2 = Set(StateTrees1, fun aec_trees:contracts/1,
                       fun aec_trees:set_contracts/2,
-                      fun aect_state_tree:enter_contract/2,
+                      fun aect_state_tree:insert_contract/2,
                       Contracts),
     StateTrees2.
 
@@ -335,3 +393,31 @@ poi_and_payload(ChannelPubkey, IAmt, RAmt, Round, BothPrivkeys) ->
             aec_trees:new_poi(OffChainTrees),
             [Initiator, Responder]),
     {PoI, Payload}.
+
+new_contract(Owner, ContractPath, InitFun, InitArgs, CreateRound, Deposit) ->
+    OwnerId = aec_id:create(account, Owner),
+    VmVersion = 1,
+    {ok, Code} = compile_contract(ContractPath),
+    {ok, CallData} = aect_sophia:encode_call_data(Code, InitFun, InitArgs),
+    OffChainTrees = aec_trees:new_without_backend(),
+    {OnChainEnv, OnChainTrees} =
+        aetx_env:tx_env_and_trees_from_top(aetx_contract),
+    {ContractId, Contract0, Trees1} =
+        aect_channel_contract:new(Owner, CreateRound, VmVersion, Code,
+                                  Deposit, OffChainTrees),
+    ContractPubkey    = aect_contracts:pubkey(Contract0),
+    Call = aect_call:new(OwnerId, CreateRound, ContractId, CreateRound, 0),
+    Trees = aect_channel_contract:run_new(ContractPubkey, Call, CallData, Trees1,
+                                          OnChainTrees, OnChainEnv),
+    Contract = aect_state_tree:get_contract(ContractPubkey,
+                                            aec_trees:contracts(Trees)).
+
+make_call(ContractPath, Fun, Args) ->
+    {ok, Code} = compile_contract(ContractPath),
+    {ok, CallData} = aect_sophia:encode_call_data(Code, Fun, Args),
+    CallData.
+    
+
+compile_contract(FileName) ->
+    {ok, ContractBin} = file:read_file(FileName),
+    aect_sophia:compile(ContractBin, <<>>).
